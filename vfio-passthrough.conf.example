@@ -1,0 +1,24 @@
+# =============================================================================
+# VFIO Passthrough Configuration
+# Copy to ~/.config/vfio-passthrough.conf (recommended)
+# Or to /etc/vfio-passthrough.conf for system-wide defaults
+# =============================================================================
+
+# GPU PCI IDs
+# Find your IDs with: lspci -nn | grep -i nvidia
+# Format: DDDD:BB:DD.F (domain:bus:device.function)
+GPU_PCI_ID="0000:01:00.0"
+GPU_AUDIO_PCI_ID="0000:01:00.1"
+
+# User and group for VFIO device permissions
+# The user running the VM needs access to /dev/vfio/<group>
+VFIO_USER="user"
+VFIO_GROUP="kvm"
+
+# State file location (stores original driver bindings)
+STATE_FILE="/run/vfio_state"
+
+# Restart nvidia-persistenced after restoring GPU to host
+# Set to false if you don't use this service or have issues
+NVIDIA_RESTART=true
+
