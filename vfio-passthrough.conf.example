@@ -3,9 +3,13 @@
 # Copy to ~/.config/vfio-passthrough.conf (recommended)
 # Or to /etc/vfio-passthrough.conf for system-wide defaults
 # =============================================================================
+#
+# NOTE: This file is parsed as key=value pairs, NOT sourced as bash.
+# Only simple assignments are supported. No command substitution, variables,
+# or complex expressions.
 
 # GPU PCI IDs
-# Find your IDs with: lspci -nn | grep -i nvidia
+# Find your IDs with: lspci -nn | grep -E "VGA|3D|Display"
 # Format: DDDD:BB:DD.F (domain:bus:device.function)
 GPU_PCI_ID="0000:01:00.0"
 GPU_AUDIO_PCI_ID="0000:01:00.1"
@@ -16,9 +20,10 @@ VFIO_USER="user"
 VFIO_GROUP="kvm"
 
 # State file location (stores original driver bindings)
+# /run is recommended as it's cleared on reboot
 STATE_FILE="/run/vfio_state"
 
 # Restart nvidia-persistenced after restoring GPU to host
 # Set to false if you don't use this service or have issues
+# Only applies to NVIDIA GPUs; ignored for AMD/Intel
 NVIDIA_RESTART=true
-

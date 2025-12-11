@@ -3,14 +3,27 @@
 Why should I give up my GPU just to spin up a VM?
 
 ## Overview
-This repository provides two small Bash scripts to switch a dedicated GPU between the Linux host and a virtual machine (e.g., QEMU/KVM) on demand:
-- `host_to_vm.sh` — Unbinds the specified GPU from the host driver and binds it to vfio‑pci for passthrough to a VM.
-- `vm_to_host.sh` — Restores the GPU bindings back to the original host drivers using state captured during the handoff.
+A Bash script to switch a dedicated GPU between the Linux host and a virtual machine (e.g., QEMU/KVM) on demand:
+
+```bash
+vfio-swap to-vm      # Unbind GPU from host, bind to vfio-pci for VM
+vfio-swap to-host    # Restore GPU to host drivers after VM shutdown
+```
 
 ## Why
-I wrote these scripts because I thought it made no sense to tell the kernel to completely ignore a GPU during boot just to have it ready for the VMs. I need the dGPU to be available on the host at every boot, for games, machine learning, and general compute tasks, but sometimes I just want it available for a VM for all those programs I need to run through Windows because of missing native Linux apps.
+I wrote this because I thought it made no sense to tell the kernel to completely ignore a GPU during boot just to have it ready for the VMs. I need the dGPU to be available on the host at every boot, for games, machine learning, and general compute tasks, but sometimes I just want it available for a VM for all those programs I need to run through Windows because of missing native Linux apps.
 
-The scripts aim to be easy to read, explicit in what they do, and minimal. The last thing I want is to lock your session or leaving the GPU in an unusable state.
+The script aims to be easy to read, explicit in what it does, and minimal. The last thing I want is to lock your session or leave the GPU in an unusable state.
+
+## Supported Hardware
+
+| Vendor | Status | Notes |
+|--------|--------|-------|
+| NVIDIA | Tested | Full support including nvidia-persistenced restart |
+| AMD | Untested | Detection and DRM node handling implemented |
+| Intel | Untested | Detection and DRM node handling implemented |
+
+I don't have AMD or Intel discrete GPUs to test with. If you do and want to help, please open an issue with your results!
 
 ## System prerequisites
 ### Hardware
@@ -22,211 +35,172 @@ The scripts aim to be easy to read, explicit in what they do, and minimal. The l
   - Intel: VT‑d and IOMMU
   - AMD: SVM and IOMMU
 
-### Kernel parameters (GRUB, systemdboot or similar)
-- Enable IOMMU and, for NVIDIA, consider disabling certain mitigations if needed for your environment. Examples:
+### Kernel parameters (GRUB, systemd-boot or similar)
+- Enable IOMMU. Examples:
   - Intel: `intel_iommu=on iommu=pt`
-  - AMD: `iommu=pt`
-    > Note: AMD CPUs don't need `amd_iommu=on`
+  - AMD: `iommu=pt` (AMD CPUs don't need `amd_iommu=on`)
 
 ### Operating system and packages
-- Any Linux distribution with recent kernel and KVM/QEMU stack should do fine
-- Packages/tools:
+- Any Linux distribution with recent kernel and KVM/QEMU stack
+- Required packages:
   - `pciutils` (for `lspci`)
   - `psmisc` (for `fuser`)
   - `kmod` (for `modprobe`)
-  - `util‑linux` (for `lsmod`)
-- Optional: Looking Glass components and `kvmfr` kernel module if you plan to use `/dev/kvmfr0`
+- Optional: Looking Glass and `kvmfr` kernel module
 
 
-## Prep work
-- Always run these scripts as root. They enforce this requirement.
-- Ensure your display server is not attached to the GPU you plan to passthrough. The script will refuse to proceed if it detects Xorg, Xwayland, KWin, GNOME Shell, SDDM, or GDM using the device.
-- Back up your system configuration and be prepared with an out‑of‑band access method in case display output is lost.
-- The state file is protected with restrictive permissions (600) and symlink validation.
+## Quick Start
+
+```bash
+# Copy and edit config
+cp vfio-passthrough.conf.example ~/.config/vfio-passthrough.conf
+nano ~/.config/vfio-passthrough.conf
+
+# Preview what would happen
+sudo ./vfio-swap to-vm --dry-run --verbose
+
+# Actually switch to VM mode
+sudo ./vfio-swap to-vm
+
+# Start your VM...
+
+# After VM shutdown, restore GPU
+sudo ./vfio-swap to-host
+```
+
+
+## Usage
+
+```
+vfio-swap v1.0.0 - On-demand GPU passthrough
+
+Usage: vfio-swap <command> [options]
+
+Commands:
+  to-vm       Unbind GPU from host and prepare for VM passthrough
+  to-host     Restore GPU to host after VM shutdown
+
+Global Options:
+  -n, --dry-run     Show what would be done without making changes
+  -v, --verbose     Enable verbose output
+  -l, --log         Enable syslog logging
+  -h, --help        Show help message
+  --version         Show version information
+```
+
+### to-vm options
+```
+  -g, --gpu ID      GPU PCI ID (default: 0000:01:00.0)
+  -a, --audio ID    GPU Audio PCI ID (default: 0000:01:00.1)
+  -f, --force       Force operation even if GPU appears already passed through
+```
+
+### to-host options
+```
+  -f, --force           Force operation (ignore state file validation errors)
+  --no-nvidia-restart   Skip nvidia-persistenced restart
+```
+
+### Examples
+```bash
+# Switch GPU to VM with custom PCI IDs
+sudo ./vfio-swap to-vm -g 0000:02:00.0 -a 0000:02:00.1
+
+# Force switch even if state file exists (e.g., after crash)
+sudo ./vfio-swap to-vm --force
+
+# Restore with verbose output and logging
+sudo ./vfio-swap to-host --verbose --log
+
+# View logs
+journalctl -t vfio-passthrough
+```
 
 
 ## Configuration
 
 ### Config File (Recommended)
-Create `~/.config/vfio-passthrough.conf` to set default values. See `vfio-passthrough.conf.example` for a template:
+Create `~/.config/vfio-passthrough.conf`:
 
 ```bash
-# Copy the example config to your user config directory
-mkdir -p ~/.config
 cp vfio-passthrough.conf.example ~/.config/vfio-passthrough.conf
-nano ~/.config/vfio-passthrough.conf
 ```
 
-The scripts check these locations in order (first found wins):
+The script checks these locations (first found wins):
 1. `~/.config/vfio-passthrough.conf` — user config
 2. `/etc/vfio-passthrough.conf` — system-wide fallback
 
-Config file options:
-- `GPU_PCI_ID` — PCI ID of the GPU video function, e.g., `0000:01:00.0`
-- `GPU_AUDIO_PCI_ID` — PCI ID of the GPU audio function, e.g., `0000:01:00.1`
-- `NVIDIA_RESTART` — Whether to restart nvidia-persistenced after restoration (default: `true`)
+Config options:
+- `GPU_PCI_ID` — PCI ID of the GPU video function (e.g., `0000:01:00.0`)
+- `GPU_AUDIO_PCI_ID` — PCI ID of the GPU audio function (e.g., `0000:01:00.1`)
+- `VFIO_USER` / `VFIO_GROUP` — Owner for VFIO device nodes
+- `NVIDIA_RESTART` — Whether to restart nvidia-persistenced (default: `true`)
 
-### Command‑Line Arguments
-Both scripts support command‑line arguments that override config file and defaults:
-
-**host_to_vm.sh:**
-```
-Usage: host_to_vm.sh [OPTIONS]
-
-Options:
-  -g, --gpu ID          GPU PCI ID (default: 0000:01:00.0)
-  -a, --audio ID        GPU Audio PCI ID (default: 0000:01:00.1)
-  -n, --dry-run         Show what would be done without making changes
-  -v, --verbose         Enable verbose output
-  -l, --log             Enable syslog logging
-  -h, --help            Show help message
-```
-
-**vm_to_host.sh:**
-```
-Usage: vm_to_host.sh [OPTIONS]
-
-Options:
-  -n, --dry-run             Show what would be done without making changes
-  -v, --verbose             Enable verbose output
-  -l, --log                 Enable syslog logging
-  --no-nvidia-restart       Skip nvidia-persistenced restart
-  -h, --help                Show help message
-```
-
-### Script Variables
-If not using the config file, the scripts use these defaults (editable in the scripts):
-- `VFIO_USER` — Username that should own VFIO device nodes during VM usage
-- `VFIO_GROUP` — Group that should own VFIO device nodes during VM usage (e.g., `kvm`)
-- `STATE_FILE` — Temporary path for saving original bindings (default: `/run/vfio_state`)
-
-
-### Identify your GPU PCI IDs
-Use `lspci` to find the relevant functions. Typical dGPU exposes two functions: video and audio.
-Example:
-```
-lspci -nn | grep -E "VGA|3D|Audio"
+### Finding your GPU PCI IDs
+```bash
+lspci -nn | grep -E "VGA|3D|Display|Audio"
 # 01:00.0 VGA compatible controller: NVIDIA Corporation ...
 # 01:00.1 Audio device: NVIDIA Corporation ...
 ```
-Then use `0000:01:00.0` and `0000:01:00.1` in your config or arguments.
+Use `0000:01:00.0` and `0000:01:00.1` in your config.
 
 
-## Step-by-step checklist
-1. Enable IOMMU and verify groups (see above)
+## Prep work
+- Always run as root (enforced by the script)
+- Ensure your display server is **not** attached to the GPU you plan to passthrough
+- The script detects and blocks if Xorg, Xwayland, KWin, GNOME Shell, Mutter, Weston, Sway, SDDM, or GDM are using the device
+- Back up your system and have out‑of‑band access ready in case display output is lost
 
-2. Install required tools
-
-3. Ensure appropriate drivers and modules are working correctly:
-   - Host GPU drivers (e.g., nvidia, nvidia_drm, amdgpu) should be installed and working.
-   - vfio‑pci should be available. The script loads it as needed.
-   - If using Looking Glass, ensure the `kvmfr` module is available (the script loads it if present).
-
-4. User and group permissions
-   - VFIO_USER should be your user that runs the VM.
-   - VFIO_GROUP typically is kvm. Ensure your user belongs to this group
-
-5. Verify no critical processes use the passthrough GPU
-   - The script will check /dev/nvidia* and block if the display server is attached.
-
-
-## Usage
-
-### Preview with Dry Run
-Before making changes, preview what the scripts will do:
-```bash
-sudo ./host_to_vm.sh --dry-run --verbose
-sudo ./vm_to_host.sh --dry-run --verbose
-```
-
-### Switch Host → VM
-1. Configure your GPU IDs (config file or arguments).
-2. Run as root:
-    ```bash
-    sudo ./host_to_vm.sh
-    # Or with custom GPU:
-    sudo ./host_to_vm.sh -g 0000:02:00.0 -a 0000:02:00.1
-    ```
-3. When prompted, confirm termination of processes that hold the GPU (if any).
-4. Start your VM with the vfio‑pci devices corresponding to your GPU and audio function. Ensure the VM XML or QEMU command attaches the IOMMU group correctly.
-
-### Switch VM → Host
-1. Shut down the VM that uses the GPU.
-2. Run as root:
-    ```bash
-    sudo ./vm_to_host.sh
-    ```
-3. Verify on host. For NVIDIA GPUs, run `nvidia-smi` and ensure the GPU is listed correctly.
-
-### Enable Logging
-For debugging or audit trails, enable syslog logging:
-```bash
-sudo ./host_to_vm.sh --log --verbose
-# View logs with:
-journalctl -t vfio-passthrough
-```
 
 ## Troubleshooting
+
 > Don't panic.
->
-> -- <cite>Douglas Adams</cite>
+> — Douglas Adams
 
-- The script says the display server is attached
-  - Ensure your desktop is using a different GPU (iGPU or secondary dGPU). Move display outputs if necessary and configure your compositor accordingly. Ensure HDMI and DP cables are **not** attached to the GPU ports.
-
-- GPU is still in use after killing apps
-  - Some services may respawn. Disable or stop the offending services before running the script.
-
-- No video output in VM
-  - Confirm the correct IOMMU group is attached to the VM and that vbios/firmware settings are correct for your GPU model.
-
-- VM shuts down but GPU will not rebind
-  - Ensure the VM has released the device. Verify that no vfio‑userspace or QEMU processes are still running. Then run `vm_to_host.sh` again.
-
-- Permissions on `/dev/vfio/<group>`
-  - Re‑run `host_to_vm.sh` to reset ownership. Confirm VFIO_USER and VFIO_GROUP are correct.
-
-- Script interrupted mid‑execution
-  - The scripts have trap handlers that preserve state on interruption. Re‑run `vm_to_host.sh` to restore the GPU if needed.
-
-- IOMMU not enabled errors
-  - Verify kernel parameters with `cat /proc/cmdline`. Ensure `intel_iommu=on` is present for Intel CPUs. Reboot after adding parameters and enabling IOMMU from the BIOS.
+| Problem | Solution |
+|---------|----------|
+| "Display server is attached" | Move your desktop to a different GPU (iGPU). Disconnect cables from passthrough GPU. |
+| "GPU already in passthrough mode" | Run `vfio-swap to-host` first, or use `--force` if state is stale |
+| GPU still in use after killing apps | Some services respawn. Stop them manually before running the script. |
+| No video in VM | Check IOMMU group attachment and vbios settings for your GPU |
+| GPU won't rebind after VM | Ensure VM fully released the device. Check for lingering QEMU processes. |
+| Invalid PCI ID format | Use format `DDDD:BB:DD.F` (e.g., `0000:01:00.0`). Run `lspci -nn` to find IDs. |
+| IOMMU not enabled | Check `cat /proc/cmdline` for `intel_iommu=on` or `iommu=pt`. Enable in BIOS. |
 
 
-## Frequently asked questions
-### Do I need a second GPU?
-Yes. But integrated GPUs are more than enough. This is exactly my setup. Using the same GPU for both host display and VM is unsafe and not supported by these scripts.
+## FAQ
 
-### Can I use this with AMD GPUs?
-Yes. The scripts __should__ work with any GPU but I haven't been able to test them with AMD hardware since my only dGPU is from team green. The nvidia-specific features (device node checking, persistenced restart) are optional and skipped for AMD GPUs.
+**Do I need a second GPU?**
+Yes, but integrated GPUs work fine. That's my setup. Using the same GPU for host display and VM is unsafe and unsupported.
 
-### How do I debug issues?
-Use `--dry-run` to preview actions, `--verbose` for detailed output, and `--log` to send output to syslog for later review.
+**Can I use this with AMD/Intel GPUs?**
+The code for detecting and handling AMD/Intel GPUs is there, but I haven't tested it since I only have an NVIDIA card. It should work, but let me know if it doesn't.
+
+**How do I debug?**
+Use `--dry-run` to preview, `--verbose` for details, and `--log` for syslog output.
+
+
+## Project Structure
+```
+vfio-swap/
+├── vfio-swap                      # Main script
+├── lib/
+│   └── common.sh                  # Shared library
+├── host_to_vm.sh                  # Wrapper (ease of use)
+├── vm_to_host.sh                  # Wrapper (ease of use)
+├── vfio-passthrough.conf.example
+├── README.md
+└── LICENSE
+```
 
 
 ## Contributing
-Found a bug? Having issues/improvements? Feel free to open an issue or a PR!
-If you need assistance, please include distro, kernel version, hardware and the steps you made, it helps a lot.
+Found a bug or have improvements? Open an issue or PR!
+
+If you need help, include your distro, kernel version, hardware, and what you tried. It helps a lot.
+
 
 ## License
-MIT License
+MIT License — Copyright (c) 2025
 
-Copyright (c) 2025
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+See [LICENSE](LICENSE) for full text.

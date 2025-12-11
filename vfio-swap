@@ -1,0 +1,621 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =============================================================================
+# vfio-swap: On-demand GPU passthrough (Host ⇄ VM)
+# =============================================================================
+
+readonly VERSION="1.0.0"
+
+# --- Load shared library ---
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! -f "${SCRIPT_DIR}/lib/common.sh" ]]; then
+    echo "[ERROR] Library not found: ${SCRIPT_DIR}/lib/common.sh" >&2
+    exit 1
+fi
+# shellcheck source=lib/common.sh
+source "${SCRIPT_DIR}/lib/common.sh"
+
+# --- Script-specific vars ---
+COMMAND=""
+GPU_ID=""
+GPU_AUDIO_ID=""
+VFIO_USER=""
+VFIO_GROUP=""
+STATE_FILE=""
+ENABLE_NVIDIA_RESTART=true
+FORCE=false
+
+# =============================================================================
+# USAGE
+# =============================================================================
+
+usage_main() {
+    cat <<EOF
+vfio-swap v${VERSION} - On-demand GPU passthrough
+
+Usage: $(basename "$0") <command> [options]
+
+Commands:
+  to-vm       Unbind GPU from host and prepare for VM passthrough
+  to-host     Restore GPU to host after VM shutdown
+
+Global Options:
+  -n, --dry-run     Show what would be done without making changes
+  -v, --verbose     Enable verbose output
+  -l, --log         Enable syslog logging
+  -h, --help        Show this help message
+  --version         Show version information
+
+Examples:
+  $(basename "$0") to-vm                        # Switch GPU to VM mode
+  $(basename "$0") to-vm -g 0000:02:00.0        # Specify GPU PCI ID
+  $(basename "$0") to-host                      # Restore GPU to host
+  $(basename "$0") to-vm --dry-run --verbose    # Preview actions
+
+Run '$(basename "$0") <command> --help' for command-specific options.
+EOF
+    exit 0
+}
+
+usage_to_vm() {
+    cat <<EOF
+Usage: $(basename "$0") to-vm [options]
+
+Unbind GPU from host and prepare for VM passthrough.
+
+Options:
+  -g, --gpu ID      GPU PCI ID (default: $DEFAULT_GPU_ID)
+  -a, --audio ID    GPU Audio PCI ID (default: $DEFAULT_GPU_AUDIO_ID)
+  -f, --force       Force operation even if GPU appears already passed through
+  -n, --dry-run     Show what would be done without making changes
+  -v, --verbose     Enable verbose output
+  -l, --log         Enable syslog logging
+  -h, --help        Show this help message
+
+Config file locations (first found is used):
+  ~/.config/vfio-passthrough.conf  (user config)
+  /etc/vfio-passthrough.conf       (system fallback)
+EOF
+    exit 0
+}
+
+usage_to_host() {
+    cat <<EOF
+Usage: $(basename "$0") to-host [options]
+
+Restore GPU to host after VM shutdown.
+
+Options:
+  -f, --force           Force operation (ignore state file validation errors)
+  -n, --dry-run         Show what would be done without making changes
+  -v, --verbose         Enable verbose output
+  -l, --log             Enable syslog logging
+  --no-nvidia-restart   Skip nvidia-persistenced restart
+  -h, --help            Show this help message
+
+Config file locations (first found is used):
+  ~/.config/vfio-passthrough.conf  (user config)
+  /etc/vfio-passthrough.conf       (system fallback)
+EOF
+    exit 0
+}
+
+# =============================================================================
+# ARGUMENT PARSING
+# =============================================================================
+
+parse_command() {
+    if [[ $# -eq 0 ]]; then
+        usage_main
+    fi
+    
+    case "$1" in
+        to-vm|to_vm|host-to-vm|host_to_vm)
+            COMMAND="to-vm"
+            shift
+            parse_args_to_vm "$@"
+            ;;
+        to-host|to_host|vm-to-host|vm_to_host)
+            COMMAND="to-host"
+            shift
+            parse_args_to_host "$@"
+            ;;
+        -h|--help)
+            usage_main
+            ;;
+        --version)
+            echo "vfio-swap v${VERSION}"
+            exit 0
+            ;;
+        *)
+            log_error "Unknown command: $1"
+            echo "Run '$(basename "$0") --help' for usage."
+            exit 1
+            ;;
+    esac
+}
+
+parse_args_to_vm() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -g|--gpu)
+                [[ $# -lt 2 ]] && { log_error "Missing value for $1"; exit 1; }
+                GPU_ID="$2"
+                shift 2
+                ;;
+            -a|--audio)
+                [[ $# -lt 2 ]] && { log_error "Missing value for $1"; exit 1; }
+                GPU_AUDIO_ID="$2"
+                shift 2
+                ;;
+            -f|--force)
+                FORCE=true
+                shift
+                ;;
+            -n|--dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -l|--log)
+                ENABLE_LOGGING=true
+                shift
+                ;;
+            -h|--help)
+                usage_to_vm
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                usage_to_vm
+                ;;
+        esac
+    done
+}
+
+parse_args_to_host() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--force)
+                FORCE=true
+                shift
+                ;;
+            -n|--dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -l|--log)
+                ENABLE_LOGGING=true
+                shift
+                ;;
+            --no-nvidia-restart)
+                ENABLE_NVIDIA_RESTART=false
+                shift
+                ;;
+            -h|--help)
+                usage_to_host
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                usage_to_host
+                ;;
+        esac
+    done
+}
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+apply_config() {
+    load_config_safe
+    
+    # Priority: CLI args > config file > defaults
+    GPU_ID="${GPU_ID:-${CONFIG_GPU_PCI_ID:-$DEFAULT_GPU_ID}}"
+    GPU_AUDIO_ID="${GPU_AUDIO_ID:-${CONFIG_GPU_AUDIO_PCI_ID:-$DEFAULT_GPU_AUDIO_ID}}"
+    VFIO_USER="${CONFIG_VFIO_USER:-$DEFAULT_VFIO_USER}"
+    VFIO_GROUP="${CONFIG_VFIO_GROUP:-$DEFAULT_VFIO_GROUP}"
+    STATE_FILE="${CONFIG_STATE_FILE:-$DEFAULT_STATE_FILE}"
+    
+    # NVIDIA restart setting
+    if [[ "$ENABLE_NVIDIA_RESTART" == true ]]; then
+        case "${CONFIG_NVIDIA_RESTART:-true}" in
+            false|no|0) ENABLE_NVIDIA_RESTART=false ;;
+        esac
+    fi
+}
+
+# =============================================================================
+# CLEANUP HANDLERS
+# =============================================================================
+
+cleanup_to_vm() {
+    local exit_code=$?
+    
+    [[ "$CLEANUP_DONE" == true ]] && return
+    CLEANUP_DONE=true
+    
+    if [[ $exit_code -ne 0 ]]; then
+        log_warn "Script interrupted or failed (exit code: $exit_code)"
+        
+        if [[ -f "$STATE_FILE" && ! -s "$STATE_FILE" ]]; then
+            log_debug "Removing empty state file"
+            rm -f "$STATE_FILE"
+        fi
+    fi
+}
+
+cleanup_to_host() {
+    local exit_code=$?
+    
+    [[ "$CLEANUP_DONE" == true ]] && return
+    CLEANUP_DONE=true
+    
+    if [[ $exit_code -ne 0 ]]; then
+        log_warn "Script interrupted or failed (exit code: $exit_code)"
+        log_warn "State file preserved at $STATE_FILE for manual recovery"
+    fi
+}
+
+# =============================================================================
+# TO-VM: Bind GPU to vfio-pci
+# =============================================================================
+
+bind_device_to_vfio() {
+    local dev="$1"
+    local sysfs="/sys/bus/pci/devices/$dev"
+
+    if [[ ! -d "$sysfs" ]]; then
+        log_warn "Device $dev not found in sysfs. Skipping."
+        return
+    fi
+
+    # Wake device from D3 power state
+    if [[ -r "$sysfs/config" ]]; then
+        cat "$sysfs/config" >/dev/null 2>&1 || true
+    fi
+
+    local driver_link="$sysfs/driver"
+    if [[ -L "$driver_link" ]]; then
+        local driver_name
+        driver_name=$(basename "$(readlink -f "$driver_link")")
+
+        if [[ "$driver_name" == "vfio-pci" ]]; then
+            log_info "$dev is already bound to vfio-pci."
+            return
+        fi
+
+        if [[ "$DRY_RUN" != true ]]; then
+            append_state "$STATE_FILE" "$dev" "$driver_name"
+        else
+            log_info "[DRY-RUN] Would save state: $dev uses $driver_name"
+        fi
+
+        log_info "Unbinding $dev from $driver_name..."
+        if [[ "$DRY_RUN" != true ]]; then
+            echo "$dev" > "$driver_link/unbind"
+            wait_for_condition "driver unbind" "[[ ! -L '$sysfs/driver' ]]" 5 0.2 || true
+        fi
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "[DRY-RUN] Would bind $dev to vfio-pci"
+        return
+    fi
+
+    echo "vfio-pci" > "$sysfs/driver_override"
+    echo "$dev" > "/sys/bus/pci/drivers/vfio-pci/bind"
+    
+    if wait_for_condition "vfio-pci bind" "[[ -L '$sysfs/driver' ]] && [[ \$(basename \$(readlink -f '$sysfs/driver')) == 'vfio-pci' ]]" 3 0.2; then
+        log_info "Bound $dev to vfio-pci."
+    else
+        log_error "Failed to bind $dev to vfio-pci"
+        exit 1
+    fi
+}
+
+cmd_to_vm() {
+    trap cleanup_to_vm EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    
+    apply_config
+    ensure_root
+
+    local FULL_GPU_ID FULL_AUDIO_ID
+    FULL_GPU_ID=$(resolve_pci_id "$GPU_ID" "GPU")
+    FULL_AUDIO_ID=$(resolve_pci_id "$GPU_AUDIO_ID" "GPU Audio")
+    
+    local gpu_vendor
+    gpu_vendor=$(get_gpu_vendor "$FULL_GPU_ID")
+    
+    log_info "GPU: $FULL_GPU_ID (vendor: $gpu_vendor), Audio: $FULL_AUDIO_ID"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "=== DRY RUN MODE - No changes will be made ==="
+    fi
+
+    # Check if already in passthrough mode
+    if [[ "$DRY_RUN" != true ]] && is_gpu_in_passthrough "$STATE_FILE"; then
+        if [[ "$FORCE" == true ]]; then
+            log_warn "GPU appears already in passthrough mode. Forcing anyway (--force)."
+            rm -f "$STATE_FILE"
+        else
+            log_error "GPU appears to already be in passthrough mode."
+            log_error "State file exists at $STATE_FILE"
+            log_error "Run 'vfio-swap to-host' first, or use --force to override."
+            exit 1
+        fi
+    fi
+
+    # Initialize state file
+    if [[ "$DRY_RUN" != true ]]; then
+        if ! init_state_file "$STATE_FILE"; then
+            exit 1
+        fi
+    fi
+
+    # Load kernel modules
+    log_info "Loading required kernel modules..."
+    dry_run_cmd modprobe kvmfr 2>/dev/null || log_debug "kvmfr module not available (optional)"
+    
+    if ! dry_run_cmd modprobe vfio-pci; then
+        log_error "Failed to load vfio-pci module. Is VFIO enabled in kernel?"
+        exit 1
+    fi
+    
+    if [[ "$DRY_RUN" != true ]] && [[ ! -d "/sys/bus/pci/drivers/vfio-pci" ]]; then
+        log_error "vfio-pci driver not available after modprobe"
+        exit 1
+    fi
+
+    # Check for processes using the GPU
+    local device_nodes
+    device_nodes=$(get_gpu_device_nodes "$gpu_vendor" "$FULL_GPU_ID")
+    
+    if [[ -n "$device_nodes" ]]; then
+        if ! check_and_release_gpu "$device_nodes" "$DRY_RUN"; then
+            exit 1
+        fi
+    else
+        log_info "No device nodes found for $gpu_vendor GPU. May already be unbound."
+    fi
+
+    # Bind devices to vfio-pci
+    bind_device_to_vfio "$FULL_AUDIO_ID"
+    bind_device_to_vfio "$FULL_GPU_ID"
+
+    # IOMMU group detection
+    local iommu_link="/sys/bus/pci/devices/$FULL_GPU_ID/iommu_group"
+    if [[ ! -L "$iommu_link" ]]; then
+        log_error "Device $FULL_GPU_ID is not in an IOMMU group."
+        log_error "Check that IOMMU is enabled in BIOS and kernel (intel_iommu=on or amd_iommu=on)"
+        exit 1
+    fi
+    
+    local iommu_group
+    iommu_group=$(basename "$(readlink -f "$iommu_link")")
+    log_debug "IOMMU group: $iommu_group"
+    
+    # Set permissions
+    if [[ "$DRY_RUN" != true ]]; then
+        if [[ -c "/dev/vfio/$iommu_group" ]]; then
+            chown "$VFIO_USER:$VFIO_GROUP" "/dev/vfio/$iommu_group"
+            chmod 660 "/dev/vfio/$iommu_group"
+            log_info "Permissions set for /dev/vfio/$iommu_group"
+        else
+            log_warn "/dev/vfio/$iommu_group not found - VM may need root"
+        fi
+        
+        if [[ -c "/dev/kvmfr0" ]]; then
+            chown "$VFIO_USER:$VFIO_GROUP" /dev/kvmfr0
+            chmod 660 /dev/kvmfr0
+            log_info "Permissions set for /dev/kvmfr0"
+        fi
+    fi
+
+    echo "========================================================"
+    log_info "GPU ready for VM passthrough."
+    echo "========================================================"
+}
+
+# =============================================================================
+# TO-HOST: Restore GPU to host drivers
+# =============================================================================
+
+rebind_device() {
+    local pci_id="$1"
+    local target_driver="$2"
+    local sysfs_path="/sys/bus/pci/devices/${pci_id}"
+
+    log_info "--- Restoring ${pci_id} to '${target_driver}' ---"
+
+    if [[ ! -d "${sysfs_path}" ]]; then
+        log_error "Device ${pci_id} not found. Skipping."
+        return 1
+    fi
+
+    if [[ -e "${sysfs_path}/driver" ]]; then
+        local current_driver
+        current_driver=$(basename "$(readlink -f "${sysfs_path}/driver")")
+        
+        if [[ "${current_driver}" == "${target_driver}" ]]; then
+            log_info "Device is already bound to ${target_driver}. Skipping."
+            return 0
+        fi
+
+        log_info "Unbinding from ${current_driver}..."
+        if [[ "$DRY_RUN" == true ]]; then
+            log_info "[DRY-RUN] Would unbind from ${current_driver}"
+        else
+            if ! echo "${pci_id}" > "${sysfs_path}/driver/unbind"; then
+                log_error "Failed to unbind. Is the VM still running?"
+                return 1
+            fi
+            wait_for_condition "driver unbind" "[[ ! -L '${sysfs_path}/driver' ]]" 5 0.2 || true
+        fi
+    fi
+
+    if [[ "$DRY_RUN" != true ]]; then
+        echo > "${sysfs_path}/driver_override"
+    fi
+
+    log_info "Binding to ${target_driver}..."
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "[DRY-RUN] Would bind to ${target_driver}"
+        return 0
+    fi
+    
+    local bind_success=false
+    
+    if [[ -e "/sys/bus/pci/drivers/${target_driver}/bind" ]]; then
+        if echo "${pci_id}" > "/sys/bus/pci/drivers/${target_driver}/bind" 2>/dev/null; then
+            bind_success=true
+        else
+            log_warn "Direct bind failed, trying drivers_probe..."
+        fi
+    fi
+    
+    if [[ "$bind_success" != true ]]; then
+        log_debug "Triggering global driver probe for ${pci_id}..."
+        if ! echo "${pci_id}" > /sys/bus/pci/drivers_probe 2>/dev/null; then
+            log_error "drivers_probe failed for ${pci_id}"
+        fi
+    fi
+
+    if wait_for_condition "driver bind" "[[ -e '${sysfs_path}/driver' ]]" 5 0.2; then
+        local new_driver
+        new_driver=$(basename "$(readlink -f "${sysfs_path}/driver")")
+        
+        if [[ "${new_driver}" == "${target_driver}" ]]; then
+            log_info "Success: ${pci_id} is using ${target_driver}."
+            return 0
+        else
+            log_warn "${pci_id} bound to ${new_driver} instead of ${target_driver}."
+            return 0
+        fi
+    else
+        log_error "Device ${pci_id} has no driver after rebind attempt"
+        return 1
+    fi
+}
+
+restart_nvidia_services() {
+    if [[ "$ENABLE_NVIDIA_RESTART" != true ]]; then
+        log_debug "NVIDIA service restart disabled"
+        return 0
+    fi
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "[DRY-RUN] Would restart nvidia-persistenced if present"
+        return 0
+    fi
+    
+    if systemctl list-unit-files 2>/dev/null | grep -q nvidia-persistenced; then
+        log_info "Restarting nvidia-persistenced..."
+        if ! systemctl restart nvidia-persistenced; then
+            log_warn "Failed to restart nvidia-persistenced (non-fatal)"
+        fi
+    else
+        log_debug "nvidia-persistenced service not found"
+    fi
+}
+
+cmd_to_host() {
+    trap cleanup_to_host EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    
+    apply_config
+    ensure_root
+
+    if [[ ! -f "${STATE_FILE}" ]]; then
+        log_error "No state file found at ${STATE_FILE}."
+        log_error "Did you run 'vfio-swap to-vm' first?"
+        exit 1
+    fi
+
+    if ! validate_state_file "$STATE_FILE"; then
+        if [[ "$FORCE" == true ]]; then
+            log_warn "State file validation failed but continuing (--force)"
+        else
+            exit 1
+        fi
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "=== DRY RUN MODE - No changes will be made ==="
+        log_info "State file contents:"
+        cat "${STATE_FILE}"
+        echo ""
+    fi
+
+    local had_errors=false
+    local gpu_vendor=""
+
+    while IFS=, read -r pci_id driver; do
+        if [[ -n "$pci_id" && -n "$driver" ]]; then
+            if [[ -z "$gpu_vendor" ]]; then
+                gpu_vendor=$(get_gpu_vendor "$pci_id")
+                log_debug "Detected GPU vendor: $gpu_vendor"
+            fi
+            
+            if ! rebind_device "$pci_id" "$driver"; then
+                had_errors=true
+            fi
+        fi
+    done < "${STATE_FILE}"
+
+    if [[ "$had_errors" == true ]]; then
+        log_warn "Some devices failed to rebind. State file preserved."
+        log_warn "Review errors above and run again, or manually clean up."
+    else
+        if [[ "$DRY_RUN" != true ]]; then
+            rm -f "${STATE_FILE}"
+            log_debug "State file removed"
+        fi
+    fi
+
+    if [[ "$gpu_vendor" == "nvidia" ]]; then
+        restart_nvidia_services
+    fi
+
+    echo "========================================================"
+    if [[ "$had_errors" == true ]]; then
+        log_warn "GPU returned to Host with errors. Check above."
+    else
+        log_info "GPU returned to Host successfully."
+    fi
+    
+    case "$gpu_vendor" in
+        nvidia) log_info "Run 'nvidia-smi' to verify." ;;
+        amd)    log_info "Run 'rocm-smi' or check 'lspci -k' to verify." ;;
+        intel)  log_info "Check 'lspci -k' or 'intel_gpu_top' to verify." ;;
+        *)      log_info "Check 'lspci -k' to verify driver binding." ;;
+    esac
+    echo "========================================================"
+    
+    if [[ "$had_errors" == true ]]; then
+        exit 1
+    fi
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+parse_command "$@"
+
+case "$COMMAND" in
+    to-vm)   cmd_to_vm ;;
+    to-host) cmd_to_host ;;
+esac
+
