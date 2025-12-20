@@ -215,7 +215,7 @@ parse_args_to_host() {
 # =============================================================================
 
 apply_config() {
-    load_config_safe
+    load_config
     
     # Priority: CLI args > config file > defaults
     GPU_ID="${GPU_ID:-${CONFIG_GPU_PCI_ID:-$DEFAULT_GPU_ID}}"
