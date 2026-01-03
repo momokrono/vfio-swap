@@ -23,7 +23,8 @@ VFIO_GROUP="kvm"
 # /run is recommended as it's cleared on reboot
 STATE_FILE="/run/vfio_state"
 
-# Restart nvidia-persistenced after restoring GPU to host
-# Set to false if you don't use this service or have issues
-# Only applies to NVIDIA GPUs; ignored for AMD/Intel
-NVIDIA_RESTART=true
+# Extra services to stop before GPU passthrough and restart after
+# Space or comma-separated list of service names (with or without .service suffix)
+# These are stopped IN ADDITION to automatically detected GPU-holding services
+# Example: EXTRA_SERVICES="lactd fancontrol"
+EXTRA_SERVICES=""

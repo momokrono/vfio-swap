@@ -17,7 +17,7 @@ DEFAULT_GPU_AUDIO_ID="0000:01:00.1"
 DEFAULT_VFIO_USER="user"
 DEFAULT_VFIO_GROUP="kvm"
 DEFAULT_STATE_FILE="/run/vfio_state"
-DEFAULT_NVIDIA_RESTART="true"
+DEFAULT_EXTRA_SERVICES=""
 
 # --- Runtime State (set by scripts) ---
 DRY_RUN=false
@@ -77,7 +77,7 @@ get_config_file() {
 # Parse config file
 # Usage: load_config
 # Sets: CONFIG_GPU_PCI_ID, CONFIG_GPU_AUDIO_PCI_ID, CONFIG_VFIO_USER, 
-#       CONFIG_VFIO_GROUP, CONFIG_STATE_FILE, CONFIG_NVIDIA_RESTART
+#       CONFIG_VFIO_GROUP, CONFIG_STATE_FILE, CONFIG_EXTRA_SERVICES
 load_config() {
     local config_file
     config_file=$(get_config_file)
@@ -88,7 +88,7 @@ load_config() {
     CONFIG_VFIO_USER=""
     CONFIG_VFIO_GROUP=""
     CONFIG_STATE_FILE=""
-    CONFIG_NVIDIA_RESTART=""
+    CONFIG_EXTRA_SERVICES=""
     
     if [[ -z "$config_file" ]]; then
         log_debug "No config file found, using defaults"
@@ -131,7 +131,7 @@ load_config() {
             VFIO_USER)        CONFIG_VFIO_USER="$value" ;;
             VFIO_GROUP)       CONFIG_VFIO_GROUP="$value" ;;
             STATE_FILE)       CONFIG_STATE_FILE="$value" ;;
-            NVIDIA_RESTART)   CONFIG_NVIDIA_RESTART="$value" ;;
+            EXTRA_SERVICES)   CONFIG_EXTRA_SERVICES="$value" ;;
             *)                log_debug "Unknown config key: $key" ;;
         esac
     done < "$config_file"
@@ -268,15 +268,160 @@ get_expected_driver() {
 }
 
 # =============================================================================
+# SERVICE DETECTION
+# =============================================================================
+
+# Detect if a PID belongs to a systemd service (system or user)
+# Returns: "system:<service_name>" or "user:<uid>:<service_name>" or empty string
+# System services run under /system.slice/
+# User services run under /user.slice/user-<UID>.slice/user@<UID>.service/
+get_service_for_pid() {
+    local pid="$1"
+    local cgroup_file="/proc/$pid/cgroup"
+    
+    if [[ ! -f "$cgroup_file" ]]; then
+        echo ""
+        return
+    fi
+    
+    # Parse cgroup file - systemd v2 format: 0::/path/to/slice/foo.service
+    local cgroup_path
+    cgroup_path=$(cat "$cgroup_file" 2>/dev/null | grep -oP '(?<=::).*' | head -1)
+    
+    # Check for system service first
+    if [[ "$cgroup_path" =~ ^/system\.slice/(.+\.service)$ ]]; then
+        echo "system:${BASH_REMATCH[1]}"
+        return
+    elif [[ "$cgroup_path" =~ /([^/]+\.service)$ ]] && [[ "$cgroup_path" == *"system.slice"* ]]; then
+        # Handle nested paths like /system.slice/system-foo.slice/bar.service
+        echo "system:${BASH_REMATCH[1]}"
+        return
+    fi
+    
+    # Check for user service: /user.slice/user-1000.slice/user@1000.service/app.slice/foo.service
+    if [[ "$cgroup_path" =~ /user\.slice/user-([0-9]+)\.slice/user@[0-9]+\.service/.*/([^/]+\.service)$ ]]; then
+        local uid="${BASH_REMATCH[1]}"
+        local service="${BASH_REMATCH[2]}"
+        echo "user:${uid}:${service}"
+        return
+    fi
+    
+    echo ""
+}
+
+# Parse service type from get_service_for_pid output
+# Returns: "system", "user", or ""
+get_service_type() {
+    local service_info="$1"
+    echo "${service_info%%:*}"
+}
+
+# Parse service name from get_service_for_pid output
+# Returns the service name (e.g., "nvidia-persistenced.service")
+get_service_name() {
+    local service_info="$1"
+    local type="${service_info%%:*}"
+    
+    if [[ "$type" == "system" ]]; then
+        echo "${service_info#system:}"
+    elif [[ "$type" == "user" ]]; then
+        # user:1000:foo.service -> foo.service
+        echo "${service_info##*:}"
+    else
+        echo ""
+    fi
+}
+
+# Parse user UID from get_service_for_pid output (for user services)
+# Returns the UID or empty string
+get_service_uid() {
+    local service_info="$1"
+    if [[ "$service_info" =~ ^user:([0-9]+): ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo ""
+    fi
+}
+
+# Stop a service (handles both system and user services)
+# Args: service_info (from get_service_for_pid)
+# Returns: 0 on success, 1 on failure
+stop_service() {
+    local service_info="$1"
+    local type
+    type=$(get_service_type "$service_info")
+    local name
+    name=$(get_service_name "$service_info")
+    
+    if [[ "$type" == "system" ]]; then
+        log_info "Stopping system service: $name"
+        systemctl stop "$name" 2>/dev/null
+    elif [[ "$type" == "user" ]]; then
+        local uid
+        uid=$(get_service_uid "$service_info")
+        local username
+        username=$(id -nu "$uid" 2>/dev/null || echo "")
+        
+        if [[ -z "$username" ]]; then
+            log_warn "Could not resolve UID $uid to username"
+            return 1
+        fi
+        
+        log_info "Stopping user service: $name (user: $username)"
+        sudo -u "$username" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user stop "$name" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+# Start a service (handles both system and user services)
+# Args: service_info (formatted as stored in state file)
+# Returns: 0 on success, 1 on failure
+start_service() {
+    local service_info="$1"
+    local type
+    type=$(get_service_type "$service_info")
+    local name
+    name=$(get_service_name "$service_info")
+    
+    if [[ "$type" == "system" ]]; then
+        log_info "Starting system service: $name"
+        systemctl start "$name" 2>/dev/null
+    elif [[ "$type" == "user" ]]; then
+        local uid
+        uid=$(get_service_uid "$service_info")
+        local username
+        username=$(id -nu "$uid" 2>/dev/null || echo "")
+        
+        if [[ -z "$username" ]]; then
+            log_warn "Could not resolve UID $uid to username"
+            return 1
+        fi
+        
+        log_info "Starting user service: $name (user: $username)"
+        sudo -u "$username" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user start "$name" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+# =============================================================================
 # PROCESS MANAGEMENT
 # =============================================================================
 
+# Global array to track stopped services (populated by check_and_release_gpu)
+STOPPED_SERVICES=()
+
 # Check for processes using device nodes and optionally kill them
-# Args: device_nodes (space-separated), dry_run (true/false)
+# Args: device_nodes (space-separated), dry_run (true/false), extra_services (space-separated, optional)
 # Returns: 0 if GPU is free, 1 if still in use
+# Side effect: Populates STOPPED_SERVICES array with services that were stopped
 check_and_release_gpu() {
     local device_nodes="$1"
     local dry_run="${2:-false}"
+    local extra_services="${3:-}"
+    
+    STOPPED_SERVICES=()
     
     if [[ -z "$device_nodes" ]]; then
         log_info "No device nodes to check."
@@ -290,86 +435,152 @@ check_and_release_gpu() {
     # shellcheck disable=SC2086
     pids=$(fuser $device_nodes 2>/dev/null | tr -s ' ' '\n' | sort -u | grep -v '^$' || true)
     
-    if [[ -z "$pids" ]]; then
+    if [[ -z "$pids" && -z "$extra_services" ]]; then
         log_info "GPU is free. No processes detected."
         return 0
     fi
     
-    # Resolve PIDs to app names
-    local app_names=""
+    # Classify PIDs into services and programs
+    local services=()
+    local service_pids=()
+    local programs=()
+    local program_pids=()
+    
     for pid in $pids; do
         local name
         name=$(ps -p "$pid" -o comm= 2>/dev/null || true)
-        if [[ -n "$name" ]]; then
-            app_names="$app_names $name"
+        [[ -z "$name" ]] && continue
+        
+        local service
+        service=$(get_service_for_pid "$pid")
+        
+        if [[ -n "$service" ]]; then
+            # It's a systemd service - avoid duplicates
+            if [[ ! " ${services[*]} " =~ " ${service} " ]]; then
+                services+=("$service")
+            fi
+            service_pids+=("$pid")
+        else
+            # It's a regular program
+            if [[ ! " ${programs[*]} " =~ " ${name} " ]]; then
+                programs+=("$name")
+            fi
+            program_pids+=("$pid")
         fi
     done
     
-    app_names=$(echo "$app_names" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+    # Add extra services from config (if not already detected)
+    # Extra services are assumed to be system services
+    for svc in $extra_services; do
+        # Normalize: add .service suffix if missing
+        [[ "$svc" != *.service ]] && svc="${svc}.service"
+        local svc_info="system:${svc}"
+        if [[ ! " ${services[*]} " =~ " ${svc_info} " ]]; then
+            # Check if the service exists and is active
+            if systemctl is-active "$svc" >/dev/null 2>&1; then
+                services+=("$svc_info")
+                log_debug "Added extra service from config: $svc"
+            else
+                log_debug "Extra service $svc is not active, skipping"
+            fi
+        fi
+    done
     
-    echo "--------------------------------------------------------"
-    log_warn "The following applications are holding the GPU:"
-    echo "$app_names"
-    echo "PIDs: $pids"
-    echo "--------------------------------------------------------"
+    # Check for display server before proceeding
+    for prog in "${programs[@]}"; do
+        if [[ "$prog" =~ ^(Xorg|Xwayland|kwin|gnome-shell|sddm|gdm|mutter|weston|sway)$ ]]; then
+            log_error "CRITICAL: Your Display Server ($prog) is attached to this GPU."
+            log_error "Aborting to prevent session crash."
+            log_error "Ensure your desktop uses a different GPU (iGPU or secondary dGPU)."
+            return 1
+        fi
+    done
     
-    # Check for display server
-    if echo "$app_names" | grep -E -q "Xorg|Xwayland|kwin|gnome-shell|sddm|gdm|mutter|weston|sway"; then
-        log_error "CRITICAL: Your Display Server is attached to this GPU."
-        log_error "Aborting to prevent session crash."
-        log_error "Ensure your desktop uses a different GPU (iGPU or secondary dGPU)."
-        return 1
+    # Display what we found
+    echo "--------------------------------------------------------"
+    if [[ ${#services[@]} -gt 0 ]]; then
+        log_warn "Services holding the GPU (will be stopped and restarted later):"
+        for svc_info in "${services[@]}"; do
+            local svc_type svc_name
+            svc_type=$(get_service_type "$svc_info")
+            svc_name=$(get_service_name "$svc_info")
+            if [[ "$svc_type" == "user" ]]; then
+                local svc_uid
+                svc_uid=$(get_service_uid "$svc_info")
+                printf "  - %s (user service, uid=%s)\n" "$svc_name" "$svc_uid"
+            else
+                printf "  - %s (system service)\n" "$svc_name"
+            fi
+        done
     fi
+    if [[ ${#programs[@]} -gt 0 ]]; then
+        log_warn "Programs holding the GPU (will be terminated):"
+        printf "  - %s\n" "${programs[@]}"
+    fi
+    if [[ ${#program_pids[@]} -gt 0 ]]; then
+        echo "Program PIDs: ${program_pids[*]}"
+    fi
+    echo "--------------------------------------------------------"
     
-    if [[ "$dry_run" == true ]]; then
-        log_info "[DRY-RUN] Would kill these applications and wait for GPU release"
+    if [[ ${#services[@]} -eq 0 && ${#programs[@]} -eq 0 ]]; then
+        log_info "GPU is free. No processes detected."
         return 0
     fi
     
-    echo "We must terminate these applications to proceed."
-    read -r -t 30 -p "Kill now? [y/N]: " reply || reply=""
+    if [[ "$dry_run" == true ]]; then
+        log_info "[DRY-RUN] Would stop services: ${services[*]:-none}"
+        log_info "[DRY-RUN] Would kill programs: ${programs[*]:-none}"
+        STOPPED_SERVICES=("${services[@]}")
+        return 0
+    fi
+    
+    echo "We must stop these services/applications to proceed."
+    read -r -t 30 -p "Proceed? [y/N]: " reply || reply=""
     if [[ ! "$reply" =~ ^[Yy]$ ]]; then
         log_info "Aborting at user request."
         return 1
     fi
     
-    # Strategy: try SIGTERM by PID, then use pkill with name if the process respawns
-    # This takes care of apps like Spotify/Discord where parent respawns GPU-using children
-    
-    log_info "Sending SIGTERM to processes..."
-    for pid in $pids; do
-        kill -15 "$pid" 2>/dev/null || true
+    # Step 1: Stop services via systemctl (clean shutdown)
+    for svc_info in "${services[@]}"; do
+        if stop_service "$svc_info"; then
+            STOPPED_SERVICES+=("$svc_info")
+        else
+            log_warn "Failed to stop service (may already be stopped)"
+        fi
     done
     
-    # Wait for GPU release
-    # shellcheck disable=SC2086
-    if wait_for_condition "GPU to be released" "! fuser $device_nodes >/dev/null 2>&1" 5 0.5; then
-        log_info "Applications terminated gracefully."
-        return 0
+    # Step 2: Kill programs (existing logic)
+    if [[ ${#program_pids[@]} -gt 0 ]]; then
+        log_info "Sending SIGTERM to programs..."
+        for pid in "${program_pids[@]}"; do
+            kill -15 "$pid" 2>/dev/null || true
+        done
+        
+        # Wait for GPU release
+        # shellcheck disable=SC2086
+        if ! wait_for_condition "GPU to be released" "! fuser $device_nodes >/dev/null 2>&1" 5 0.5; then
+            # Processes respawned or refused to die - escalate to killing by name
+            log_warn "Processes still holding GPU. Killing by application name..."
+            for app in "${programs[@]}"; do
+                log_debug "Stopping all '$app' processes..."
+                pkill -15 "$app" 2>/dev/null || true
+            done
+            
+            # shellcheck disable=SC2086
+            if ! wait_for_condition "GPU to be released" "! fuser $device_nodes >/dev/null 2>&1" 5 0.5; then
+                # Dropping nuke: SIGKILL by name
+                log_warn "Apps refused to close. Sending SIGKILL..."
+                for app in "${programs[@]}"; do
+                    pkill -9 "$app" 2>/dev/null || true
+                done
+            fi
+        fi
     fi
     
-    # Processes respawned or refused to die - escalate to killing by name
-    # This catches parent processes that respawn GPU-using children
-    log_warn "Processes still holding GPU. Killing by application name..."
-    for app in $app_names; do
-        log_debug "Stopping all '$app' processes..."
-        pkill -15 "$app" 2>/dev/null || true
-    done
-    
+    # Final check
     # shellcheck disable=SC2086
-    if wait_for_condition "GPU to be released" "! fuser $device_nodes >/dev/null 2>&1" 5 0.5; then
-        log_info "Applications terminated after escalation."
-        return 0
-    fi
-    
-    # Dropping nuke: SIGKILL by name
-    log_warn "Apps refused to close. Sending SIGKILL..."
-    for app in $app_names; do
-        pkill -9 "$app" 2>/dev/null || true
-    done
-    
-    # shellcheck disable=SC2086
-    if ! wait_for_condition "GPU release after SIGKILL" "! fuser $device_nodes >/dev/null 2>&1" 3 0.5; then
+    if ! wait_for_condition "GPU release" "! fuser $device_nodes >/dev/null 2>&1" 3 0.5; then
         log_error "GPU is STILL in use. A process likely respawned or is unkillable."
         # shellcheck disable=SC2086
         fuser -v $device_nodes 2>&1 || true
@@ -463,6 +674,96 @@ append_state() {
     echo "$pci_id,$driver" >> "$temp_file"
     mv "$temp_file" "$state_file"
     chmod 600 "$state_file"
+}
+
+# Append stopped services to state file
+# Args: state_file, services (array of service_info strings like "system:foo.service" or "user:1000:bar.service")
+append_services_to_state() {
+    local state_file="$1"
+    shift
+    local services=("$@")
+    
+    if [[ ${#services[@]} -eq 0 ]]; then
+        log_debug "No services to save to state file"
+        return 0
+    fi
+    
+    local temp_file="${state_file}.tmp.$$"
+    cp "$state_file" "$temp_file"
+    
+    for svc_info in "${services[@]}"; do
+        # Check for duplicates
+        if grep -q "^SERVICE:${svc_info}$" "$temp_file" 2>/dev/null; then
+            log_debug "Service $svc_info already in state file"
+            continue
+        fi
+        local svc_name
+        svc_name=$(get_service_name "$svc_info")
+        log_info "Saving stopped service: $svc_name"
+        echo "SERVICE:${svc_info}" >> "$temp_file"
+    done
+    
+    mv "$temp_file" "$state_file"
+    chmod 600 "$state_file"
+}
+
+# Read services from state file
+# Returns: newline-separated list of service_info strings
+get_services_from_state() {
+    local state_file="$1"
+    
+    if [[ ! -f "$state_file" ]]; then
+        echo ""
+        return
+    fi
+    
+    grep "^SERVICE:" "$state_file" 2>/dev/null | sed 's/^SERVICE://' || true
+}
+
+# Restart services that were saved in state file
+# Args: state_file, dry_run
+restart_saved_services() {
+    local state_file="$1"
+    local dry_run="${2:-false}"
+    
+    local services
+    services=$(get_services_from_state "$state_file")
+    
+    if [[ -z "$services" ]]; then
+        log_debug "No services to restart from state file"
+        return 0
+    fi
+    
+    log_info "Restarting saved services..."
+    
+    local had_errors=false
+    while IFS= read -r svc_info; do
+        [[ -z "$svc_info" ]] && continue
+        
+        local svc_name svc_type
+        svc_name=$(get_service_name "$svc_info")
+        svc_type=$(get_service_type "$svc_info")
+        
+        if [[ "$dry_run" == true ]]; then
+            if [[ "$svc_type" == "user" ]]; then
+                local svc_uid
+                svc_uid=$(get_service_uid "$svc_info")
+                log_info "[DRY-RUN] Would restart user service: $svc_name (uid=$svc_uid)"
+            else
+                log_info "[DRY-RUN] Would restart system service: $svc_name"
+            fi
+            continue
+        fi
+        
+        if ! start_service "$svc_info"; then
+            had_errors=true
+        fi
+    done <<< "$services"
+    
+    if [[ "$had_errors" == true ]]; then
+        return 1
+    fi
+    return 0
 }
 
 # =============================================================================

@@ -23,7 +23,7 @@ GPU_AUDIO_ID=""
 VFIO_USER=""
 VFIO_GROUP=""
 STATE_FILE=""
-ENABLE_NVIDIA_RESTART=true
+EXTRA_SERVICES=""
 FORCE=false
 
 # =============================================================================
@@ -91,7 +91,6 @@ Options:
   -n, --dry-run         Show what would be done without making changes
   -v, --verbose         Enable verbose output
   -l, --log             Enable syslog logging
-  --no-nvidia-restart   Skip nvidia-persistenced restart
   -h, --help            Show this help message
 
 Config file locations (first found is used):
@@ -195,10 +194,6 @@ parse_args_to_host() {
                 ENABLE_LOGGING=true
                 shift
                 ;;
-            --no-nvidia-restart)
-                ENABLE_NVIDIA_RESTART=false
-                shift
-                ;;
             -h|--help)
                 usage_to_host
                 ;;
@@ -224,12 +219,9 @@ apply_config() {
     VFIO_GROUP="${CONFIG_VFIO_GROUP:-$DEFAULT_VFIO_GROUP}"
     STATE_FILE="${CONFIG_STATE_FILE:-$DEFAULT_STATE_FILE}"
     
-    # NVIDIA restart setting
-    if [[ "$ENABLE_NVIDIA_RESTART" == true ]]; then
-        case "${CONFIG_NVIDIA_RESTART:-true}" in
-            false|no|0) ENABLE_NVIDIA_RESTART=false ;;
-        esac
-    fi
+    # Extra services to stop/restart (normalize: replace commas with spaces)
+    EXTRA_SERVICES="${CONFIG_EXTRA_SERVICES:-$DEFAULT_EXTRA_SERVICES}"
+    EXTRA_SERVICES="${EXTRA_SERVICES//,/ }"
 }
 
 # =============================================================================
@@ -380,9 +372,14 @@ cmd_to_vm() {
     local device_nodes
     device_nodes=$(get_gpu_device_nodes "$gpu_vendor" "$FULL_GPU_ID")
     
-    if [[ -n "$device_nodes" ]]; then
-        if ! check_and_release_gpu "$device_nodes" "$DRY_RUN"; then
+    if [[ -n "$device_nodes" ]] || [[ -n "$EXTRA_SERVICES" ]]; then
+        if ! check_and_release_gpu "$device_nodes" "$DRY_RUN" "$EXTRA_SERVICES"; then
             exit 1
+        fi
+        
+        # Save stopped services to state file
+        if [[ "$DRY_RUN" != true ]] && [[ ${#STOPPED_SERVICES[@]} -gt 0 ]]; then
+            append_services_to_state "$STATE_FILE" "${STOPPED_SERVICES[@]}"
         fi
     else
         log_info "No device nodes found for $gpu_vendor GPU. May already be unbound."
@@ -508,27 +505,6 @@ rebind_device() {
     fi
 }
 
-restart_nvidia_services() {
-    if [[ "$ENABLE_NVIDIA_RESTART" != true ]]; then
-        log_debug "NVIDIA service restart disabled"
-        return 0
-    fi
-    
-    if [[ "$DRY_RUN" == true ]]; then
-        log_info "[DRY-RUN] Would restart nvidia-persistenced if present"
-        return 0
-    fi
-    
-    if systemctl list-unit-files 2>/dev/null | grep -q nvidia-persistenced; then
-        log_info "Restarting nvidia-persistenced..."
-        if ! systemctl restart nvidia-persistenced; then
-            log_warn "Failed to restart nvidia-persistenced (non-fatal)"
-        fi
-    else
-        log_debug "nvidia-persistenced service not found"
-    fi
-}
-
 cmd_to_host() {
     trap cleanup_to_host EXIT
     trap 'exit 130' INT
@@ -574,6 +550,9 @@ cmd_to_host() {
         fi
     done < "${STATE_FILE}"
 
+    # Restart services that were stopped during to-vm (before removing state file)
+    restart_saved_services "$STATE_FILE" "$DRY_RUN"
+
     if [[ "$had_errors" == true ]]; then
         log_warn "Some devices failed to rebind. State file preserved."
         log_warn "Review errors above and run again, or manually clean up."
@@ -582,10 +561,6 @@ cmd_to_host() {
             rm -f "${STATE_FILE}"
             log_debug "State file removed"
         fi
-    fi
-
-    if [[ "$gpu_vendor" == "nvidia" ]]; then
-        restart_nvidia_services
     fi
 
     echo "========================================================"
