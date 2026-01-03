@@ -735,8 +735,16 @@ check_and_release_gpu() {
     
     # Step 2: Stop transient apps via systemctl (clean shutdown, no restart)
     # Track apps that fail to stop so we can kill them
+    # Check GPU status between apps - if already free, skip remaining
     local failed_apps=()
     for app_info in "${apps[@]}"; do
+        # Check if GPU is already free - skip remaining apps
+        # shellcheck disable=SC2086
+        if ! fuser $device_nodes >/dev/null 2>&1; then
+            log_info "GPU already released, skipping remaining apps"
+            break
+        fi
+        
         if ! stop_service "$app_info" 5; then  # 5 second timeout for apps
             # Extract friendly name for kill chain
             local app_name
