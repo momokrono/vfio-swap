@@ -746,7 +746,15 @@ check_and_release_gpu() {
     fi
     
     # Step 1: Stop services via systemctl (clean shutdown, save for restart)
+    # Check GPU status between services - if already free, skip remaining
     for svc_info in "${services[@]}"; do
+        # Check if GPU is already free - skip remaining services
+        # shellcheck disable=SC2086
+        if ! fuser $device_nodes >/dev/null 2>&1; then
+            log_info "GPU already released, skipping remaining services/apps"
+            break
+        fi
+        
         if stop_service "$svc_info"; then
             STOPPED_SERVICES+=("$svc_info")
         else
