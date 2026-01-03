@@ -620,7 +620,28 @@ check_and_release_gpu() {
             
             if [[ "$svc_type" == "app" ]]; then
                 # Transient app - can stop via systemctl but don't restart
-                if [[ ! " ${apps[*]} " =~ " ${service_info} " ]]; then
+                # Deduplicate by friendly name (cursor, spotify) not full scope ID
+                local app_scope_name
+                app_scope_name=$(get_service_name "$service_info")
+                local friendly_app_name="$app_scope_name"
+                if [[ "$app_scope_name" =~ ^app-([^@]+)@ ]]; then
+                    friendly_app_name="${BASH_REMATCH[1]}"
+                fi
+                
+                # Check if we already have this app (by friendly name)
+                local already_have=false
+                for existing in "${apps[@]}"; do
+                    local existing_name
+                    existing_name=$(get_service_name "$existing")
+                    if [[ "$existing_name" =~ ^app-([^@]+)@ ]]; then
+                        if [[ "${BASH_REMATCH[1]}" == "$friendly_app_name" ]]; then
+                            already_have=true
+                            break
+                        fi
+                    fi
+                done
+                
+                if [[ "$already_have" == false ]]; then
                     apps+=("$service_info")
                 fi
             else
