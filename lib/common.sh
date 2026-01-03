@@ -302,11 +302,55 @@ get_service_for_pid() {
     if [[ "$cgroup_path" =~ /user\.slice/user-([0-9]+)\.slice/user@[0-9]+\.service/.*/([^/]+\.service)$ ]]; then
         local uid="${BASH_REMATCH[1]}"
         local service="${BASH_REMATCH[2]}"
+        
+        # Exclude transient app scopes (desktop apps launched via D-Bus/XDG)
+        # These have names like: app-spotify@4063222268a84e27a52b258177c5b24a.service
+        # They are NOT real systemd services and can't be managed via systemctl
+        if [[ "$service" =~ ^app-.*@.*\.service$ ]]; then
+            echo ""  # Treat as regular program, not a service
+            return
+        fi
+        
         echo "user:${uid}:${service}"
         return
     fi
     
     echo ""
+}
+
+# Get a friendly/human-readable name for a process
+# Tries multiple sources to find the best name:
+#   1. Transient app scope from cgroup (app-cursor@xxx → cursor)
+#   2. Basename from cmdline (for bundled apps)
+#   3. Fallback to process comm name
+get_friendly_process_name() {
+    local pid="$1"
+    
+    # 1. Try cgroup - extract name from transient app scope (modern DEs)
+    local cgroup_path
+    cgroup_path=$(cat "/proc/$pid/cgroup" 2>/dev/null | grep -oP '(?<=::).*' | head -1)
+    if [[ "$cgroup_path" =~ app-([^@]+)@.*\.service ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return
+    fi
+    
+    # 2. Try cmdline - get basename of first argument
+    # This works for bundled apps like /opt/cursor/cursor or /usr/share/spotify/spotify
+    local cmdline
+    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | awk '{print $1}')
+    if [[ -n "$cmdline" ]]; then
+        local binary_name="${cmdline##*/}"
+        # Skip generic runtime names, they're not helpful
+        if [[ "$binary_name" != "electron" && "$binary_name" != "python" && \
+              "$binary_name" != "python3" && "$binary_name" != "node" && \
+              "$binary_name" != "bash" && "$binary_name" != "sh" ]]; then
+            echo "$binary_name"
+            return
+        fi
+    fi
+    
+    # 3. Fallback to comm (process name from kernel, max 15 chars)
+    ps -p "$pid" -o comm= 2>/dev/null
 }
 
 # Parse service type from get_service_for_pid output
@@ -448,7 +492,7 @@ check_and_release_gpu() {
     
     for pid in $pids; do
         local name
-        name=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+        name=$(get_friendly_process_name "$pid")
         [[ -z "$name" ]] && continue
         
         local service
