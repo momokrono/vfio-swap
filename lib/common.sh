@@ -303,11 +303,11 @@ get_service_for_pid() {
         local uid="${BASH_REMATCH[1]}"
         local service="${BASH_REMATCH[2]}"
         
-        # Exclude transient app scopes (desktop apps launched via D-Bus/XDG)
+        # Check for transient app scopes (desktop apps launched via D-Bus/XDG)
         # These have names like: app-spotify@4063222268a84e27a52b258177c5b24a.service
-        # They are NOT real systemd services and can't be managed via systemctl
+        # They CAN be stopped via systemctl --user, which cleanly terminates the app
         if [[ "$service" =~ ^app-.*@.*\.service$ ]]; then
-            echo ""  # Treat as regular program, not a service
+            echo "app:${uid}:${service}"  # Transient app - can stop but don't restart
             return
         fi
         
@@ -354,7 +354,7 @@ get_friendly_process_name() {
 }
 
 # Parse service type from get_service_for_pid output
-# Returns: "system", "user", or ""
+# Returns: "system", "user", "app", or ""
 get_service_type() {
     local service_info="$1"
     echo "${service_info%%:*}"
@@ -368,30 +368,32 @@ get_service_name() {
     
     if [[ "$type" == "system" ]]; then
         echo "${service_info#system:}"
-    elif [[ "$type" == "user" ]]; then
+    elif [[ "$type" == "user" || "$type" == "app" ]]; then
         # user:1000:foo.service -> foo.service
+        # app:1000:app-cursor@xxx.service -> app-cursor@xxx.service
         echo "${service_info##*:}"
     else
         echo ""
     fi
 }
 
-# Parse user UID from get_service_for_pid output (for user services)
+# Parse user UID from get_service_for_pid output (for user services and apps)
 # Returns the UID or empty string
 get_service_uid() {
     local service_info="$1"
-    if [[ "$service_info" =~ ^user:([0-9]+): ]]; then
-        echo "${BASH_REMATCH[1]}"
+    if [[ "$service_info" =~ ^(user|app):([0-9]+): ]]; then
+        echo "${BASH_REMATCH[2]}"
     else
         echo ""
     fi
 }
 
-# Stop a service (handles both system and user services)
-# Args: service_info (from get_service_for_pid)
-# Returns: 0 on success, 1 on failure
+# Stop a service or transient app (handles system, user services, and transient apps)
+# Args: service_info (from get_service_for_pid), timeout_secs (optional, default 10)
+# Returns: 0 on success, 1 on failure/timeout
 stop_service() {
     local service_info="$1"
+    local timeout_secs="${2:-10}"
     local type
     type=$(get_service_type "$service_info")
     local name
@@ -399,7 +401,10 @@ stop_service() {
     
     if [[ "$type" == "system" ]]; then
         log_info "Stopping system service: $name"
-        systemctl stop "$name" 2>/dev/null
+        if ! timeout "$timeout_secs" systemctl stop "$name" 2>/dev/null; then
+            log_warn "Service stop timed out or failed: $name"
+            return 1
+        fi
     elif [[ "$type" == "user" ]]; then
         local uid
         uid=$(get_service_uid "$service_info")
@@ -412,7 +417,32 @@ stop_service() {
         fi
         
         log_info "Stopping user service: $name (user: $username)"
-        sudo -u "$username" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user stop "$name" 2>/dev/null
+        if ! timeout "$timeout_secs" sudo -u "$username" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user stop "$name" 2>/dev/null; then
+            log_warn "User service stop timed out or failed: $name"
+            return 1
+        fi
+    elif [[ "$type" == "app" ]]; then
+        local uid
+        uid=$(get_service_uid "$service_info")
+        local username
+        username=$(id -nu "$uid" 2>/dev/null || echo "")
+        
+        if [[ -z "$username" ]]; then
+            log_warn "Could not resolve UID $uid to username"
+            return 1
+        fi
+        
+        # Extract friendly app name from app-cursor@xxx.service -> cursor
+        local friendly_name="$name"
+        if [[ "$name" =~ ^app-([^@]+)@ ]]; then
+            friendly_name="${BASH_REMATCH[1]}"
+        fi
+        
+        log_info "Stopping transient app: $friendly_name (user: $username)"
+        if ! timeout "$timeout_secs" sudo -u "$username" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user stop "$name" 2>/dev/null; then
+            log_warn "App stop timed out or failed: $friendly_name (will use kill chain)"
+            return 1
+        fi
     else
         return 1
     fi
@@ -456,6 +486,92 @@ start_service() {
 # Global array to track stopped services (populated by check_and_release_gpu)
 STOPPED_SERVICES=()
 
+# Kill GPU-holding programs using an escalation chain
+# Tries progressively more aggressive strategies until GPU is released
+# Args: device_nodes, pids (space-separated), program_names (space-separated)
+# Returns: 0 if GPU released, 1 if still in use after all strategies
+kill_gpu_programs() {
+    local device_nodes="$1"
+    local pids="$2"
+    local program_names="$3"
+    
+    # Collect process group IDs for the detected PIDs
+    local pgids=""
+    for pid in $pids; do
+        local pgid
+        pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+        if [[ -n "$pgid" && ! " $pgids " =~ " $pgid " ]]; then
+            pgids="$pgids $pgid"
+        fi
+    done
+    pgids="${pgids# }"  # Trim leading space
+    
+    # Define escalation strategies
+    local strategies=(
+        "sigterm_pids:SIGTERM to detected PIDs"
+        "sigterm_pgid:SIGTERM to process groups"
+        "pkill_name:pkill by process name"
+        "pkill_full:pkill by command line pattern"
+        "sigkill_pgid:SIGKILL to process groups"
+        "sigkill_name:SIGKILL by process name"
+    )
+    
+    for strategy_entry in "${strategies[@]}"; do
+        local strategy="${strategy_entry%%:*}"
+        local description="${strategy_entry#*:}"
+        
+        log_info "Kill strategy: $description"
+        
+        case "$strategy" in
+            sigterm_pids)
+                for pid in $pids; do
+                    kill -TERM "$pid" 2>/dev/null || true
+                done
+                ;;
+            sigterm_pgid)
+                for pgid in $pgids; do
+                    # Negative PGID kills the entire process group
+                    kill -TERM -"$pgid" 2>/dev/null || true
+                done
+                ;;
+            pkill_name)
+                for name in $program_names; do
+                    pkill -TERM "$name" 2>/dev/null || true
+                done
+                ;;
+            pkill_full)
+                # Match against full command line (catches electron apps by path)
+                for name in $program_names; do
+                    pkill -TERM -f "$name" 2>/dev/null || true
+                done
+                ;;
+            sigkill_pgid)
+                for pgid in $pgids; do
+                    kill -KILL -"$pgid" 2>/dev/null || true
+                done
+                ;;
+            sigkill_name)
+                for name in $program_names; do
+                    pkill -KILL "$name" 2>/dev/null || true
+                    pkill -KILL -f "$name" 2>/dev/null || true
+                done
+                ;;
+        esac
+        
+        # Check if GPU is now free
+        # shellcheck disable=SC2086
+        if wait_for_condition "GPU release" "! fuser $device_nodes >/dev/null 2>&1" 3 0.5; then
+            log_info "GPU released after: $description"
+            return 0
+        fi
+        
+        log_debug "Strategy didn't fully release GPU, escalating..."
+    done
+    
+    log_error "All kill strategies exhausted. GPU still in use."
+    return 1
+}
+
 # Check for processes using device nodes and optionally kill them
 # Args: device_nodes (space-separated), dry_run (true/false), extra_services (space-separated, optional)
 # Returns: 0 if GPU is free, 1 if still in use
@@ -484,28 +600,37 @@ check_and_release_gpu() {
         return 0
     fi
     
-    # Classify PIDs into services and programs
-    local services=()
-    local service_pids=()
-    local programs=()
-    local program_pids=()
+    # Classify PIDs into services, transient apps, and programs
+    local services=()       # System/user services (stop + restart later)
+    local apps=()           # Transient apps (stop via systemctl, no restart)
+    local programs=()       # Regular programs (kill)
+    local program_pids=()   # PIDs for kill strategies
     
     for pid in $pids; do
         local name
         name=$(get_friendly_process_name "$pid")
         [[ -z "$name" ]] && continue
         
-        local service
-        service=$(get_service_for_pid "$pid")
+        local service_info
+        service_info=$(get_service_for_pid "$pid")
         
-        if [[ -n "$service" ]]; then
-            # It's a systemd service - avoid duplicates
-            if [[ ! " ${services[*]} " =~ " ${service} " ]]; then
-                services+=("$service")
+        if [[ -n "$service_info" ]]; then
+            local svc_type
+            svc_type=$(get_service_type "$service_info")
+            
+            if [[ "$svc_type" == "app" ]]; then
+                # Transient app - can stop via systemctl but don't restart
+                if [[ ! " ${apps[*]} " =~ " ${service_info} " ]]; then
+                    apps+=("$service_info")
+                fi
+            else
+                # Real service (system or user) - stop and restart later
+                if [[ ! " ${services[*]} " =~ " ${service_info} " ]]; then
+                    services+=("$service_info")
+                fi
             fi
-            service_pids+=("$pid")
         else
-            # It's a regular program
+            # Regular program - will be killed
             if [[ ! " ${programs[*]} " =~ " ${name} " ]]; then
                 programs+=("$name")
             fi
@@ -557,6 +682,19 @@ check_and_release_gpu() {
             fi
         done
     fi
+    if [[ ${#apps[@]} -gt 0 ]]; then
+        log_warn "Desktop apps holding the GPU (will be stopped):"
+        for app_info in "${apps[@]}"; do
+            local app_name
+            app_name=$(get_service_name "$app_info")
+            # Extract friendly name from app-cursor@xxx.service -> cursor
+            if [[ "$app_name" =~ ^app-([^@]+)@ ]]; then
+                printf "  - %s\n" "${BASH_REMATCH[1]}"
+            else
+                printf "  - %s\n" "$app_name"
+            fi
+        done
+    fi
     if [[ ${#programs[@]} -gt 0 ]]; then
         log_warn "Programs holding the GPU (will be terminated):"
         printf "  - %s\n" "${programs[@]}"
@@ -566,13 +704,14 @@ check_and_release_gpu() {
     fi
     echo "--------------------------------------------------------"
     
-    if [[ ${#services[@]} -eq 0 && ${#programs[@]} -eq 0 ]]; then
+    if [[ ${#services[@]} -eq 0 && ${#apps[@]} -eq 0 && ${#programs[@]} -eq 0 ]]; then
         log_info "GPU is free. No processes detected."
         return 0
     fi
     
     if [[ "$dry_run" == true ]]; then
         log_info "[DRY-RUN] Would stop services: ${services[*]:-none}"
+        log_info "[DRY-RUN] Would stop apps: ${apps[*]:-none}"
         log_info "[DRY-RUN] Would kill programs: ${programs[*]:-none}"
         STOPPED_SERVICES=("${services[@]}")
         return 0
@@ -585,7 +724,7 @@ check_and_release_gpu() {
         return 1
     fi
     
-    # Step 1: Stop services via systemctl (clean shutdown)
+    # Step 1: Stop services via systemctl (clean shutdown, save for restart)
     for svc_info in "${services[@]}"; do
         if stop_service "$svc_info"; then
             STOPPED_SERVICES+=("$svc_info")
@@ -594,42 +733,47 @@ check_and_release_gpu() {
         fi
     done
     
-    # Step 2: Kill programs (existing logic)
-    if [[ ${#program_pids[@]} -gt 0 ]]; then
-        log_info "Sending SIGTERM to programs..."
-        for pid in "${program_pids[@]}"; do
-            kill -15 "$pid" 2>/dev/null || true
-        done
-        
-        # Wait for GPU release
-        # shellcheck disable=SC2086
-        if ! wait_for_condition "GPU to be released" "! fuser $device_nodes >/dev/null 2>&1" 5 0.5; then
-            # Processes respawned or refused to die - escalate to killing by name
-            log_warn "Processes still holding GPU. Killing by application name..."
-            for app in "${programs[@]}"; do
-                log_debug "Stopping all '$app' processes..."
-                pkill -15 "$app" 2>/dev/null || true
-            done
-            
-            # shellcheck disable=SC2086
-            if ! wait_for_condition "GPU to be released" "! fuser $device_nodes >/dev/null 2>&1" 5 0.5; then
-                # Dropping nuke: SIGKILL by name
-                log_warn "Apps refused to close. Sending SIGKILL..."
-                for app in "${programs[@]}"; do
-                    pkill -9 "$app" 2>/dev/null || true
-                done
+    # Step 2: Stop transient apps via systemctl (clean shutdown, no restart)
+    # Track apps that fail to stop so we can kill them
+    local failed_apps=()
+    for app_info in "${apps[@]}"; do
+        if ! stop_service "$app_info" 5; then  # 5 second timeout for apps
+            # Extract friendly name for kill chain
+            local app_name
+            app_name=$(get_service_name "$app_info")
+            if [[ "$app_name" =~ ^app-([^@]+)@ ]]; then
+                failed_apps+=("${BASH_REMATCH[1]}")
             fi
         fi
+    done
+    
+    # Check if GPU is now free after stopping services/apps
+    # shellcheck disable=SC2086
+    if wait_for_condition "GPU release" "! fuser $device_nodes >/dev/null 2>&1" 2 0.5; then
+        log_info "GPU released after stopping services/apps."
+        return 0
     fi
     
-    # Final check
-    # shellcheck disable=SC2086
-    if ! wait_for_condition "GPU release" "! fuser $device_nodes >/dev/null 2>&1" 3 0.5; then
-        log_error "GPU is STILL in use. A process likely respawned or is unkillable."
+    # Step 3: Kill remaining programs using escalation chain
+    # Include any apps that failed to stop gracefully
+    local all_programs=("${programs[@]}" "${failed_apps[@]}")
+    
+    if [[ ${#program_pids[@]} -gt 0 || ${#all_programs[@]} -gt 0 ]]; then
+        # Re-detect PIDs since apps may have spawned new processes
+        local current_pids
         # shellcheck disable=SC2086
-        fuser -v $device_nodes 2>&1 || true
-        log_error "Aborting unbind to prevent system hang."
-        return 1
+        current_pids=$(fuser $device_nodes 2>/dev/null | tr -s ' ' '\n' | sort -u | grep -v '^$' || true)
+        
+        local pid_list="$current_pids"
+        local name_list="${all_programs[*]}"
+        
+        if ! kill_gpu_programs "$device_nodes" "$pid_list" "$name_list"; then
+            # All strategies exhausted
+            # shellcheck disable=SC2086
+            fuser -v $device_nodes 2>&1 || true
+            log_error "Aborting unbind to prevent system hang."
+            return 1
+        fi
     fi
     
     log_info "GPU is confirmed free."
